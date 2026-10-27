@@ -13,16 +13,16 @@ const CARD_LINE_CHARS = 44;
 const MAX_CARD_LINES = 12;
 const COLUMN_GAP = '  ';
 
-// C0/C1 controls and the bidi embedding, override and isolate marks.
-const UNSAFE_CHARS =
-  /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
+// Bidi embedding, override and isolate marks.
+const BIDI_MARKS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 
-/** Feed text with whitespace controls as spaces and other controls and bidi
- * marks removed, so MnDOT text can't reorder or hide what the card shows. */
+/** Feed text with control characters as spaces and bidi marks removed, so
+ * MnDOT text can't reorder or hide what the card shows. */
 export const stripUnsafeText = (text) =>
   String(text ?? '')
-    .replace(/[\t\n\v\f\r]/g, ' ')
-    .replace(UNSAFE_CHARS, '');
+    .replace(CONTROL_CHARS, ' ')
+    .replace(BIDI_MARKS, '');
 
 const cleanRun = (text) =>
   stripUnsafeText(text)
