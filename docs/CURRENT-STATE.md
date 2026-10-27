@@ -1280,10 +1280,10 @@ id-hash prior.
 
 Cameras are ordered nearest downtown Minneapolis and St Paul first.
 `CCTV_MNDOT_MAX_SOURCES` sets the pack cap (default 1,000, bounded to 1–2000).
-In a default install, though, the shared round-robin decides how many load:
-about 230 at today's pack defaults, all near the two downtowns. Loading every
-camera also needs a higher `CCTV_MAX_SOURCES` and other packs lowered or
-switched off. A failed list contributes an empty pack until the next catalog
+The pack shares the 4,000 catalog-wide ceiling round-robin with the other
+packs, so in a default install that share, not the pack cap, decides how many
+load, nearest the two downtowns first. Loading every camera also needs a higher
+`CCTV_MAX_SOURCES` and other packs lowered or switched off. A failed list contributes an empty pack until the next catalog
 refresh. `CCTV_MNDOT_ENABLED=0` disables the pack, and `CCTV_MNDOT_URL`
 overrides the list URL.
 Gate: `src/data/cctvMndot.test.mjs`.

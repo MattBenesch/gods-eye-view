@@ -2,6 +2,7 @@ import { CCTV_SOURCE_FETCH_TIMEOUT_MS } from './constants.js';
 import {
   cameraDisplayCode,
   fallbackHeadingFromId,
+  isPlausibleLatLon,
   prioritizeSources,
 } from './normalize.js';
 import { readResponseJsonCapped } from '../common/http.js';
@@ -20,7 +21,6 @@ const DEFAULT_MNDOT_MAX_SOURCES = 1000;
 // ones included. The servlet refuses a still request without `size`, then
 // returns its native 720x480 frame whichever size is asked for.
 const MNDOT_STILL_ORIGIN = 'https://video.dot.state.mn.us';
-const MNDOT_STILL_SIZE = 'l';
 const CAMERA_NAME_RE = /^[A-Za-z0-9-]{1,40}$/;
 const NAME_MAX_CHARS = 160;
 
@@ -35,8 +35,7 @@ const ANCHORS = [
 /** Minnesota with slack for the border corridors. */
 function isLikelyMinnesotaCoordinate(lat, lon) {
   return (
-    typeof lat === 'number' &&
-    typeof lon === 'number' &&
+    isPlausibleLatLon(lat, lon) &&
     lat >= 43.4 &&
     lat <= 49.5 &&
     lon >= -97.3 &&
@@ -53,7 +52,7 @@ function isLikelyMinnesotaCoordinate(lat, lon) {
  */
 export function mndotStillUrl(name) {
   if (typeof name !== 'string' || !CAMERA_NAME_RE.test(name)) return null;
-  return `${MNDOT_STILL_ORIGIN}/video/image/metro/${name}?size=${MNDOT_STILL_SIZE}`;
+  return `${MNDOT_STILL_ORIGIN}/video/image/metro/${name}?size=l`;
 }
 
 /**
@@ -70,10 +69,10 @@ export function mndotCameraToSource(record) {
   if (record.publish !== true || record.streamable !== true) return null;
   const { lat, lon } = record;
   if (!isLikelyMinnesotaCoordinate(lat, lon)) return null;
-  const imageUrl = mndotStillUrl(record.name);
+  const camera = record.name;
+  const imageUrl = mndotStillUrl(camera);
   if (!imageUrl) return null;
 
-  const camera = record.name;
   const cameraId = `mndot-${camera.toLowerCase()}`;
   const location = String(record.location ?? '')
     .replace(/[\u0000-\u001f\u007f]+/g, ' ')

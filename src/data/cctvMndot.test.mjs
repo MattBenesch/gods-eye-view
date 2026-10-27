@@ -7,10 +7,6 @@ import {
   MNDOT_CAMERA_LIST_URL,
   MNDOT_MAX_CATALOG_BYTES,
 } from '../../server/providers/cctv/mndot.js';
-import {
-  resetTaiwanSourcesCache,
-  TAIWAN_FREEWAY_CCTV_URL,
-} from '../../server/providers/cctv/taiwan.js';
 import { allocateSourceCap } from '../../server/providers/cctv/cap.js';
 import { fallbackHeadingFromId } from '../../server/providers/cctv/normalize.js';
 import { createCctvCatalog } from '../../server/providers/cctv/catalog.js';
@@ -25,13 +21,10 @@ const ISOLATED_ENV = [
   'CCTV_MNDOT_ENABLED',
   'CCTV_MNDOT_URL',
   'CCTV_MNDOT_MAX_SOURCES',
-  'CCTV_TAIWAN_ENABLED',
-  'CCTV_TAIWAN_URL',
 ];
 
 let savedEnv = {};
 beforeEach(() => {
-  resetTaiwanSourcesCache();
   savedEnv = Object.fromEntries(
     ISOLATED_ENV.map((key) => [key, process.env[key]]),
   );
@@ -80,7 +73,6 @@ test('maps a published camera to a registered still and a low-confidence heading
   assert.equal(source.feedType, 'image');
   assert.equal(source.url, stillOf('C001'));
   assert.equal(source.snapshotUrl, source.url);
-  assert.equal(source.headingDeg, 270);
   assert.equal(source.headingConfidence, 'low');
   assert.equal(source.code, 'C001');
 });
@@ -150,13 +142,21 @@ test('unsafe or malformed camera names never produce a URL', () => {
   }
 });
 
-test('only a travel token sets the bearing; anything else uses the id prior', () => {
-  assert.equal(mndotCameraToSource(camera({ road_dir: 'NB' })).headingDeg, 0);
-  assert.equal(mndotCameraToSource(camera({ road_dir: 'EB' })).headingDeg, 90);
-  for (const road_dir of ['N-S', 'E-W', '', undefined]) {
+test('a travel token sets the bearing; anything else uses the id prior', () => {
+  const prior = fallbackHeadingFromId('mndot-c001');
+  for (const [road_dir, heading] of [
+    ['NB', 0],
+    ['EB', 90],
+    ['SB', 180],
+    ['WB', 270],
+    ['N-S', prior],
+    ['E-W', prior],
+    ['', prior],
+    [undefined, prior],
+  ]) {
     const source = mndotCameraToSource(camera({ road_dir }));
-    assert.equal(source.headingDeg, fallbackHeadingFromId('mndot-c001'));
-    assert.equal(source.headingConfidence, 'low');
+    assert.equal(source.headingDeg, heading, String(road_dir));
+    assert.equal(source.headingConfidence, 'low', String(road_dir));
   }
 });
 
@@ -173,22 +173,13 @@ test('names fall back to the camera name and are cleaned and bounded', () => {
   );
 });
 
-function mockList(t, body, { status = 200, headers = {} } = {}) {
-  const requested = [];
+function mockList(t, records) {
   t.mock.method(console, 'log', () => {});
   t.mock.method(console, 'warn', () => {});
-  t.mock.method(globalThis, 'fetch', async (url, options) => {
-    requested.push(String(url));
+  t.mock.method(globalThis, 'fetch', async (_, options) => {
     assert.equal(options.redirect, 'manual');
-    return new Response(
-      typeof body === 'string' ? body : JSON.stringify(body),
-      {
-        status,
-        headers: { 'content-type': 'application/json', ...headers },
-      },
-    );
+    return Response.json(records);
   });
-  return requested;
 }
 
 test('loader deduplicates cameras whose names differ only in case', async (t) => {
@@ -199,35 +190,27 @@ test('loader deduplicates cameras whose names differ only in case', async (t) =>
   ]);
 });
 
-test('the cap keeps the Twin Cities first, nearest first', async (t) => {
+test('the cap keeps the Twin Cities first and is clamped to 1-2000', async (t) => {
   mockList(t, [
     camera({ name: 'C900', ...DULUTH }),
     camera({ name: 'C002', ...ST_PAUL }),
     camera({ name: 'C001', ...MINNEAPOLIS }),
   ]);
-  process.env.CCTV_MNDOT_MAX_SOURCES = '2';
-  const sources = await loadMndotSources();
-  assert.deepEqual(
-    sources.map((c) => c.id),
-    ['mndot-c001', 'mndot-c002'],
-  );
-  assert.equal(sources.available, 3);
-});
-
-test('CCTV_MNDOT_MAX_SOURCES is clamped to 1-2000', async (t) => {
-  mockList(t, [
-    camera({ name: 'C001', ...MINNEAPOLIS }),
-    camera({ name: 'C002', ...ST_PAUL }),
-    camera({ name: 'C003', ...DULUTH }),
-  ]);
+  const all = ['mndot-c001', 'mndot-c002', 'mndot-c900'];
   for (const [value, expected] of [
-    ['0', 1],
-    ['2', 2],
-    ['99999', 3],
-    ['abc', 3],
+    ['0', all.slice(0, 1)],
+    ['2', all.slice(0, 2)],
+    ['99999', all],
+    ['abc', all],
   ]) {
     process.env.CCTV_MNDOT_MAX_SOURCES = value;
-    assert.equal((await loadMndotSources()).length, expected, value);
+    const sources = await loadMndotSources();
+    assert.deepEqual(
+      sources.map((c) => c.id),
+      expected,
+      value,
+    );
+    assert.equal(sources.available, 3, value);
   }
 });
 
@@ -255,22 +238,37 @@ test('a redirected, failed or malformed list contributes an empty pack', async (
   assert.deepEqual(await loadMndotSources(), []);
 });
 
-function taiwanXml() {
-  return `<?xml version='1.0' encoding='utf-8'?>
-<CCTVList><CCTVs>${[1, 2, 3, 4, 5, 6]
-    .map(
-      (n) => `<CCTV>
-    <CCTVID>CCTV-N1-S-${n}</CCTVID>
-    <VideoStreamURL>https://cctvn.freeway.gov.tw/abs2mjpg/bmjpg?camera=${n}</VideoStreamURL>
-    <PositionLon>121.5${n}</PositionLon>
-    <PositionLat>25.0${n}</PositionLat>
-    <RoadName>國道1號</RoadName>
-  </CCTV>`,
-    )
-    .join('')}</CCTVs></CCTVList>`;
-}
+test('raising the MnDOT cap cannot outgrow its round-robin share', async (t) => {
+  // 25 cameras stepping north from downtown Minneapolis, listed farthest first.
+  mockList(
+    t,
+    Array.from({ length: 25 }, (_, i) =>
+      camera({ name: `C${100 + i}`, lat: 44.98 + i * 0.01, lon: -93.27 }),
+    ).reverse(),
+  );
+  process.env.CCTV_MNDOT_MAX_SOURCES = '2000';
+  const mndot = await loadMndotSources();
+  assert.equal(mndot.length, 25);
+  const others = ['a', 'b', 'c'].map((name) => ({
+    name,
+    sources: Array.from({ length: 10 }, (_, i) => ({ id: `${name}-${i}` })),
+  }));
+  const { sources, packs } = allocateSourceCap(
+    [...others, { name: 'mndot', sources: mndot }],
+    40,
+  );
+  assert.deepEqual(
+    packs.map((pack) => pack.kept),
+    [10, 10, 10, 10],
+  );
+  assert.deepEqual(
+    sources.filter((c) => c.id.startsWith('mndot-')).map((c) => c.id),
+    mndot.slice(0, 10).map((c) => c.id),
+    'MnDOT keeps the cameras nearest the downtowns',
+  );
+});
 
-/** Stubs the MnDOT list and Taiwan table; every other pack gets an empty answer. */
+/** Stubs the MnDOT list; every other live pack gets an empty answer. */
 function mockCatalog(t, { mndot = [camera()], mndotStatus = 200 } = {}) {
   const requested = [];
   t.mock.method(console, 'log', () => {});
@@ -282,10 +280,22 @@ function mockCatalog(t, { mndot = [camera()], mndotStatus = 200 } = {}) {
       assert.equal(options.redirect, 'manual');
       return Response.json(mndot, { status: mndotStatus });
     }
-    if (href === TAIWAN_FREEWAY_CCTV_URL) return new Response(taiwanXml());
     return Response.json([]);
   });
   return requested;
+}
+
+/** An operator-configured pack beside the live packs (CCTV_SOURCES_JSON). */
+function addConfiguredPack(count) {
+  process.env.CCTV_FORCE_AUSTIN = '1';
+  process.env.CCTV_SOURCES_JSON = JSON.stringify(
+    Array.from({ length: count }, (_, i) => ({
+      id: `configured-${i}`,
+      cityId: 'configured',
+      lat: 30.27 + i * 0.01,
+      lon: -97.74,
+    })),
+  );
 }
 
 const runCatalog = () => createCctvCatalog({ sourceRoot: '/nonexistent' })();
@@ -318,13 +328,15 @@ test('CCTV_MNDOT_URL redirects the loader to the override', async (t) => {
 });
 
 test('a failed MnDOT list leaves the other packs in the catalog', async (t) => {
+  addConfiguredPack(3);
   mockCatalog(t, { mndotStatus: 503 });
   const sources = await runCatalog();
-  assert.ok(sources.some((c) => c.cityId === 'taiwan'));
+  assert.equal(sources.filter((c) => c.cityId === 'configured').length, 3);
   assert.ok(!sources.some((c) => c.cityId === 'minnesota'));
 });
 
 test('under a lowered catalog cap MnDOT shares round-robin, metro first', async (t) => {
+  addConfiguredPack(6);
   mockCatalog(t, {
     mndot: [
       camera({ name: 'C900', ...DULUTH }),
@@ -337,39 +349,9 @@ test('under a lowered catalog cap MnDOT shares round-robin, metro first', async 
   });
   process.env.CCTV_MAX_SOURCES = '8';
   const sources = await runCatalog();
-  const minnesota = sources.filter((c) => c.cityId === 'minnesota');
-  assert.equal(minnesota.length, 4);
-  assert.equal(sources.filter((c) => c.cityId === 'taiwan').length, 4);
+  assert.equal(sources.filter((c) => c.cityId === 'configured').length, 4);
   assert.deepEqual(
-    minnesota.map((c) => c.id),
+    sources.filter((c) => c.cityId === 'minnesota').map((c) => c.id),
     ['mndot-c001', 'mndot-c002', 'mndot-c005', 'mndot-c003'],
-  );
-});
-
-test('raising the MnDOT cap cannot outgrow its share of the shared budget', async (t) => {
-  // 1,300 cameras stepping north from downtown Minneapolis, listed farthest first.
-  const cameras = Array.from({ length: 1300 }, (_, i) =>
-    camera({ name: `C${10000 + i}`, lat: 44.98 + i * 0.003, lon: -93.27 }),
-  ).reverse();
-  mockList(t, cameras);
-  process.env.CCTV_MNDOT_MAX_SOURCES = '2000';
-  const mndot = await loadMndotSources();
-  assert.equal(mndot.length, 1300);
-  // Nineteen other default-sized packs offering 5,700 cameras between them.
-  const others = Array.from({ length: 19 }, (_, p) => ({
-    name: `pack${p}`,
-    sources: Array.from({ length: 300 }, (_, i) => ({ id: `p${p}-${i}` })),
-  }));
-  const { sources, packs } = allocateSourceCap(
-    [...others, { name: 'mndot', sources: mndot }],
-    4000,
-  );
-  const share = packs.find((pack) => pack.name === 'mndot');
-  assert.equal(share.kept, 200);
-  assert.equal(share.offered, 1300);
-  assert.deepEqual(
-    sources.filter((c) => c.id.startsWith('mndot-')).map((c) => c.id),
-    mndot.slice(0, 200).map((c) => c.id),
-    'the cameras kept are the ones nearest the downtowns',
   );
 });
