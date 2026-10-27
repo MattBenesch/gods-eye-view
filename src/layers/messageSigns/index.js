@@ -611,7 +611,9 @@ export function createMessageSignsLayer({
     id: MESSAGE_SIGNS_LAYER_ID,
     name: 'Highway message signs',
     icon: '🪧',
-    source: msg('MnDOT · Minnesota only'),
+    // The layer is not global, so its row says where it covers
+    // (translated as a whole by ui/layerNames.js).
+    source: 'MnDOT · Minnesota only',
     // The proxy caches about 30 s; the feeds regenerate about every 30 s.
     updateInterval: 60000,
 
