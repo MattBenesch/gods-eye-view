@@ -163,9 +163,9 @@ test('a travel token sets the bearing; anything else uses the id prior', () => {
 test('names fall back to the camera name and are cleaned and bounded', () => {
   assert.equal(mndotCameraToSource(camera({ location: '' })).name, 'C001');
   assert.equal(
-    mndotCameraToSource(camera({ location: '  I-94\u0000EB\n@  Snelling ' }))
+    mndotCameraToSource(camera({ location: '  I-94\u0000EB\n@  Benesch ' }))
       .name,
-    'I-94 EB @ Snelling',
+    'I-94 EB @ Benesch',
   );
   assert.equal(
     mndotCameraToSource(camera({ location: 'x'.repeat(500) })).name.length,
