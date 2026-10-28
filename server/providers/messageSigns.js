@@ -9,6 +9,7 @@ import {
   readResponseJsonCapped,
 } from './common/http.js';
 import { makeRateLimiter, clientKey } from './common/rate-limit.js';
+import { admitSameSiteKeyless } from './common/same-site.js';
 
 // MnDOT's IRIS public resources (keyless; listed under "Public Resources" in
 // the IRIS REST API docs). Three feeds join into the lit-sign list, and
@@ -34,10 +35,14 @@ const GIF_CACHE_MAX = 300;
 const GIF_MISS_MS = 60_000;
 const GIF_ROUTE_RE = /^\/img\/([A-Za-z0-9_]+)\.gif$/;
 
-function modifiedAt(response, now) {
-  const at = Date.parse(response.headers.get('last-modified') ?? '');
-  // A clock ahead of ours cannot make data newer than now.
-  return Number.isFinite(at) ? Math.min(at, now) : null;
+/** A feed's age when MnDOT sent it, on MnDOT's own clock (its Date header)
+ * so a skewed clock here cannot age or freshen the data. */
+function feedAge(response, now) {
+  const modified = Date.parse(response.headers.get('last-modified') ?? '');
+  if (!Number.isFinite(modified)) return null;
+  const sent = Date.parse(response.headers.get('date') ?? '');
+  // Without a Date, our clock; one ahead of ours cannot make data newer.
+  return Math.max(0, (Number.isFinite(sent) ? sent : now) - modified);
 }
 
 /** Fixed-origin, bounded MnDOT message-sign routes for dev and preview. */
@@ -84,13 +89,13 @@ export function messageSignsProxy({
           await response.body?.cancel();
           throw new Error('upstream_unavailable');
         }
-        const at = modifiedAt(response, now());
+        const age = feedAge(response, now());
         const body = await readResponseJsonCapped(
           response,
           FEED_MAX_BYTES,
           signal,
         );
-        return [key, { body, at }];
+        return [key, { body, age }];
       });
       let feeds;
       try {
@@ -101,10 +106,10 @@ export function messageSignsProxy({
       }
       // The older of the two fast feeds, so a frozen dms_message cannot hide
       // behind a sign_message that keeps regenerating.
-      const times = [feeds.states.at, feeds.messages.at].filter(
-        (at) => at !== null,
+      const ages = [feeds.states.age, feeds.messages.age].filter(
+        (age) => age !== null,
       );
-      if (!times.length) throw new Error('undated_snapshot');
+      if (!ages.length) throw new Error('undated_snapshot');
       const { signs, joinMisses } = joinMessageSigns({
         signs: feeds.signs.body,
         states: feeds.states.body,
@@ -113,7 +118,7 @@ export function messageSignsProxy({
       return {
         value: { provider: 'mndot', signs, joinMisses },
         savedAt: monotonicNow(),
-        ageAtReceipt: Math.max(0, now() - Math.min(...times)),
+        ageAtReceipt: Math.max(...ages),
       };
     } catch (error) {
       cooldownUntil = monotonicNow() + FAILURE_COOLDOWN_MS;
@@ -181,8 +186,11 @@ export function messageSignsProxy({
       gifs.set(name, cached);
       return cached;
     }
-    if (monotonicNow() < (gifMisses.get(name) ?? -Infinity)) {
-      throw Object.assign(new Error('gif_missing'), { status: 404 });
+    const miss = gifMisses.get(name);
+    if (miss && monotonicNow() < miss.until) {
+      throw Object.assign(new Error('gif_unavailable'), {
+        status: miss.status,
+      });
     }
     const { promise } = coalesceProxyRequest(gifsInFlight, name, async () => {
       try {
@@ -191,11 +199,16 @@ export function messageSignsProxy({
         while (gifs.size > GIF_CACHE_MAX) gifs.delete(gifs.keys().next().value);
         return bytes;
       } catch (error) {
-        if (error.status === 404) {
-          gifMisses.set(name, monotonicNow() + GIF_MISS_MS);
-          while (gifMisses.size > GIF_CACHE_MAX)
-            gifMisses.delete(gifMisses.keys().next().value);
-        }
+        // Every failure is remembered, so an outage costs one upstream fetch
+        // per message per cooldown rather than one per camera move.
+        const missing = error.status === 404;
+        gifMisses.delete(name);
+        gifMisses.set(name, {
+          until: monotonicNow() + (missing ? GIF_MISS_MS : FAILURE_COOLDOWN_MS),
+          status: missing ? 404 : 502,
+        });
+        while (gifMisses.size > GIF_CACHE_MAX)
+          gifMisses.delete(gifMisses.keys().next().value);
         throw error;
       }
     });
@@ -214,6 +227,11 @@ export function messageSignsProxy({
       });
       res.end(JSON.stringify(value));
     };
+    // Refuse cross-site browser requests (an <img> or fetch from another
+    // site) before the limiters or upstream see them. Same-origin app
+    // requests, non-browser loopback callers and the app served behind a
+    // reverse proxy pass.
+    if (admitSameSiteKeyless(req, res)) return;
     if (req.method !== 'GET') return json(405, { error: 'method_not_allowed' });
     const path = (req.url || '/').split('?')[0];
     const peer = clientKey(req);

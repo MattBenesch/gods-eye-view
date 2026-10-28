@@ -31,11 +31,12 @@ function gifBytes(width = 412, height = 100) {
   return bytes;
 }
 
-function feedResponse(url, { modified = MODIFIED } = {}) {
+function feedResponse(url, { modified = MODIFIED, date = null } = {}) {
   return new Response(JSON.stringify(FIXTURES[url]), {
     headers: {
       'Content-Type': 'application/json',
       ...(modified ? { 'Last-Modified': modified } : {}),
+      ...(date ? { Date: date } : {}),
     },
   });
 }
@@ -52,13 +53,19 @@ function install(options = {}, hook = 'configureServer') {
       },
     },
   });
-  return async (url = '/', method = 'GET', peer = 'local') => {
+  return async (url = '/', method = 'GET', peer = 'local', headers = {}) => {
     const res = {
-      writeHead(status, headers) {
+      headers: {},
+      writeHead(status, values) {
         this.status = status;
-        this.headers = headers;
+        this.headers = values;
+      },
+      // The same-site gate answers through statusCode + setHeader.
+      setHeader(name, value) {
+        this.headers[name] = value;
       },
       end(body) {
+        this.status ??= this.statusCode;
         this.raw = body;
         this.body =
           this.headers['Content-Type'] === 'application/json'
@@ -66,7 +73,10 @@ function install(options = {}, hook = 'configureServer') {
             : body;
       },
     };
-    await handler({ url, method, socket: { remoteAddress: peer } }, res);
+    await handler(
+      { url, method, headers, socket: { remoteAddress: peer } },
+      res,
+    );
     return res;
   };
 }
@@ -161,6 +171,41 @@ test('data age uses the older fast feed, clamped to now', async () => {
   assert.equal(stale.headers['X-Data-Stale'], 'true');
 });
 
+test("data age is read on MnDOT's clock when it sends a Date", async () => {
+  // This server's clock runs 15 minutes fast: MnDOT's Date and Last-Modified
+  // are both 15 minutes behind NOW, 12 s apart.
+  const load = (headers) => {
+    const { fetchImpl } = upstream({
+      feeds: Object.fromEntries(
+        [`${IRIS}/dms_message`, `${IRIS}/sign_message`].map((url) => [
+          url,
+          () => feedResponse(url, headers),
+        ]),
+      ),
+    });
+    return install({ fetchImpl, monotonicNow: () => 0 })();
+  };
+  const skewed = await load({
+    modified: 'Tue, 27 Oct 2026 22:07:18 GMT',
+    date: 'Tue, 27 Oct 2026 22:07:30 GMT',
+  });
+  assert.equal(skewed.status, 200);
+  assert.equal(skewed.body.ageMs, 12_000);
+  assert.equal(skewed.body.stale, false);
+
+  // Without a Date, the same feeds are aged on this clock and refused.
+  const undated = await load({ modified: 'Tue, 27 Oct 2026 22:07:18 GMT' });
+  assert.equal(undated.status, 502);
+
+  // A feed MnDOT itself last changed 11 minutes ago is still refused.
+  const frozen = await load({
+    modified: 'Tue, 27 Oct 2026 22:11:30 GMT',
+    date: 'Tue, 27 Oct 2026 22:22:30 GMT',
+  });
+  assert.equal(frozen.status, 502);
+  assert.deepEqual(frozen.body, { error: 'message_signs_unavailable' });
+});
+
 test('an undated load fails; one dated fast feed is enough', async () => {
   const none = upstream({
     feeds: {
@@ -240,21 +285,48 @@ test('a failure serves the last good list as stale until it is too old', async (
   assert.equal(expired.status, 502);
 });
 
+test('a fresh load of data already over ten minutes old is refused', async () => {
+  const old = 'Tue, 27 Oct 2026 22:11:30 GMT'; // 11 min before NOW
+  const { fetchImpl } = upstream({
+    feeds: {
+      [`${IRIS}/dms_message`]: (url) => feedResponse(url, { modified: old }),
+      [`${IRIS}/sign_message`]: (url) => feedResponse(url, { modified: old }),
+    },
+  });
+  const res = await install({ fetchImpl, monotonicNow: () => 0 })();
+  assert.equal(res.status, 502);
+  assert.equal(res.headers['Retry-After'], '60');
+  assert.deepEqual(res.body, { error: 'message_signs_unavailable' });
+});
+
 test('redirects, oversized and non-JSON bodies fail without leaking text', async () => {
+  // Valid sign_message JSON, so only the byte cap can refuse it.
+  const fixture = JSON.stringify(FIXTURES[`${IRIS}/sign_message`]);
+  const padded = JSON.stringify([
+    ...FIXTURES[`${IRIS}/sign_message`],
+    { name: 'msg_0000FFFF', multi: 'X'.repeat(600 * 1024) },
+  ]);
   const cases = {
     redirect: async () => {
       throw new TypeError('fetch failed: redirect mode is set to error');
     },
     oversized: async () =>
-      new Response('x', { headers: { 'Content-Length': String(600 * 1024) } }),
+      new Response(padded, { headers: { 'Last-Modified': MODIFIED } }),
+    declaredOversized: async () =>
+      new Response(fixture, {
+        headers: {
+          'Content-Length': String(600 * 1024),
+          'Last-Modified': MODIFIED,
+        },
+      }),
     notJson: async () => new Response('<html>upstream says hi</html>'),
   };
-  for (const make of Object.values(cases)) {
+  for (const [name, make] of Object.entries(cases)) {
     const { fetchImpl } = upstream({
       feeds: { [`${IRIS}/sign_message`]: make },
     });
     const res = await install({ fetchImpl, monotonicNow: () => 0 })();
-    assert.equal(res.status, 502);
+    assert.equal(res.status, 502, name);
     assert.doesNotMatch(res.raw, /upstream says hi|redirect|fetch failed/);
   }
 });
@@ -302,7 +374,8 @@ test('the GIF route refuses unlisted, malformed and non-GIF images', async () =>
         ),
     },
   });
-  const request = install({ fetchImpl, monotonicNow: () => 0 });
+  let clock = 0;
+  const request = install({ fetchImpl, monotonicNow: () => clock });
   await request();
   const before = calls.length;
   assert.equal((await request('/img/msg_0000BEEF.gif')).status, 404); // unlisted
@@ -314,16 +387,28 @@ test('the GIF route refuses unlisted, malformed and non-GIF images', async () =>
   assert.equal(html.status, 502);
   assert.doesNotMatch(html.raw, /nope/);
 
+  // Each of these is a valid GIF but for the one check it should fail. Each
+  // waits out the failure cooldown, so it really reaches upstream.
+  const refetch = async () => {
+    clock += 16_000;
+    const sent = calls.length;
+    const res = await request('/img/msg_AE72DF0B.gif');
+    assert.equal(calls.length, sent + 1);
+    return res;
+  };
+  responses[`${IRIS}/img/msg_AE72DF0B.gif`] = () =>
+    new Response(gifBytes(), { headers: { 'Content-Type': 'text/html' } });
+  assert.equal((await refetch()).status, 502);
   responses[`${IRIS}/img/msg_AE72DF0B.gif`] = () =>
     new Response(gifBytes(700, 100), {
       headers: { 'Content-Type': 'image/gif' },
     });
-  assert.equal((await request('/img/msg_AE72DF0B.gif')).status, 502);
+  assert.equal((await refetch()).status, 502);
+  const oversized = new Uint8Array(70 * 1024);
+  oversized.set(gifBytes());
   responses[`${IRIS}/img/msg_AE72DF0B.gif`] = () =>
-    new Response(new Uint8Array(70 * 1024), {
-      headers: { 'Content-Type': 'image/gif' },
-    });
-  assert.equal((await request('/img/msg_AE72DF0B.gif')).status, 502);
+    new Response(oversized, { headers: { 'Content-Type': 'image/gif' } });
+  assert.equal((await refetch()).status, 502);
 });
 
 test('a GIF MnDOT has deleted is a 404 that is not refetched for a minute', async () => {
@@ -348,6 +433,47 @@ test('a GIF MnDOT has deleted is a 404 that is not refetched for a minute', asyn
   assert.equal(gifCalls, 2);
 });
 
+test('any other GIF failure is a 502 that is not refetched for 15 s', async () => {
+  let clock = 0;
+  let gifCalls = 0;
+  let respond;
+  const { fetchImpl } = upstream({
+    gifs: {
+      [`${IRIS}/img/msg_AE72DF0B.gif`]: () => {
+        gifCalls += 1;
+        return respond();
+      },
+    },
+  });
+  const request = install({ fetchImpl, monotonicNow: () => clock });
+  await request();
+  const cases = {
+    unavailable: () => new Response('down', { status: 503 }),
+    timeout: () =>
+      Promise.reject(new DOMException('Timed out', 'TimeoutError')),
+    notGif: () =>
+      new Response('<html></html>', {
+        headers: { 'Content-Type': 'text/html' },
+      }),
+  };
+  for (const [name, make] of Object.entries(cases)) {
+    respond = make;
+    const sent = gifCalls;
+    const failed = await request('/img/msg_AE72DF0B.gif');
+    assert.equal(failed.status, 502, name);
+    clock += 14_000; // inside the cooldown: no upstream call
+    const held = await request('/img/msg_AE72DF0B.gif');
+    assert.equal(held.status, 502, name);
+    assert.deepEqual(held.body, { error: 'message_sign_unavailable' }, name);
+    assert.equal(gifCalls, sent + 1, name);
+    clock += 2_000; // past it: the next request goes upstream again
+  }
+  respond = () =>
+    new Response(gifBytes(), { headers: { 'Content-Type': 'image/gif' } });
+  assert.equal((await request('/img/msg_AE72DF0B.gif')).status, 200);
+  assert.equal(gifCalls, 4);
+});
+
 test('other methods, unknown paths and bursts are refused locally', async () => {
   const { calls, fetchImpl } = upstream();
   const request = install({ fetchImpl, monotonicNow: () => 0 });
@@ -360,6 +486,99 @@ test('other methods, unknown paths and bursts are refused locally', async () => 
   for (let i = 0; i < 31; i++) limited = await request('/', 'GET', 'burst');
   assert.equal(limited.status, 429);
   assert.equal(limited.headers['Retry-After'], '60');
+});
+
+test('the GIF route has its own per-peer limit', async () => {
+  const { fetchImpl } = upstream({
+    gifs: {
+      [`${IRIS}/img/msg_AE72DF0B.gif`]: () =>
+        new Response(gifBytes(), { headers: { 'Content-Type': 'image/gif' } }),
+    },
+  });
+  const request = install({ fetchImpl, monotonicNow: () => 0 });
+  await request();
+  const gif = (peer) => request('/img/msg_AE72DF0B.gif', 'GET', peer);
+  for (let i = 0; i < 240; i++) assert.equal((await gif('burst')).status, 200);
+  const limited = await gif('burst');
+  assert.equal(limited.status, 429);
+  assert.equal(limited.headers['Retry-After'], '60');
+  assert.deepEqual(limited.body, { error: 'rate_limited' });
+  assert.equal((await gif('other')).status, 200);
+});
+
+test('cross-site pages are refused before either limiter or upstream', async () => {
+  const { calls, fetchImpl } = upstream({
+    gifs: {
+      [`${IRIS}/img/msg_AE72DF0B.gif`]: () =>
+        new Response(gifBytes(), { headers: { 'Content-Type': 'image/gif' } }),
+    },
+  });
+  const request = install({ fetchImpl, monotonicNow: () => 0 });
+  await request(); // a loopback tool, with no browser headers, loads the list
+  const sent = calls.length;
+  const host = 'localhost:5173';
+  const refused = [
+    { host, 'sec-fetch-site': 'cross-site' }, // <img src> from any web page
+    { host, origin: 'https://evil.example' }, // fetch from another page
+  ];
+  // More refused requests than either per-peer quota allows.
+  for (let i = 0; i < 240; i++) {
+    const headers = refused[i % refused.length];
+    const gif = await request('/img/msg_AE72DF0B.gif', 'GET', 'page', headers);
+    assert.equal(gif.status, 403, JSON.stringify(headers));
+    if (i < 30)
+      assert.equal((await request('/', 'GET', 'page', headers)).status, 403);
+  }
+  assert.equal(calls.length, sent, 'nothing reached upstream');
+
+  // The same peer's own app still has both quotas.
+  const app = {
+    host,
+    origin: `http://${host}`,
+    'sec-fetch-site': 'same-origin',
+  };
+  assert.equal((await request('/', 'GET', 'page', app)).status, 200);
+  const gif = await request('/img/msg_AE72DF0B.gif', 'GET', 'page', app);
+  assert.equal(gif.status, 200);
+  assert.equal(
+    (await request('/img/msg_AE72DF0B.gif', 'GET', 'tool')).status,
+    200,
+  );
+});
+
+test('a GIF named by the previous list is served until the list rolls twice', async () => {
+  let clock = 0;
+  let message = 'msg_AE72DF0B';
+  const feed = (value) =>
+    new Response(JSON.stringify(value), {
+      headers: { 'Last-Modified': MODIFIED },
+    });
+  const { calls, fetchImpl } = upstream({
+    feeds: {
+      [`${IRIS}/dms_message`]: () =>
+        feed([{ name: 'V100N01', msg_current: message, failed: false }]),
+      [`${IRIS}/sign_message`]: () =>
+        feed([{ name: message, multi: 'LANE CLOSED' }]),
+    },
+    gifs: {
+      [`${IRIS}/img/msg_AE72DF0B.gif`]: () =>
+        new Response(gifBytes(), { headers: { 'Content-Type': 'image/gif' } }),
+    },
+  });
+  const request = install({ fetchImpl, monotonicNow: () => clock });
+  await request();
+
+  clock = 31_000; // past the list cache: MnDOT has replaced the message
+  message = 'msg_000000B1';
+  assert.equal((await request()).body.signs[0].message, 'msg_000000B1');
+  assert.equal((await request('/img/msg_AE72DF0B.gif')).status, 200);
+
+  clock = 62_000;
+  message = 'msg_000000B2';
+  assert.equal((await request()).body.signs[0].message, 'msg_000000B2');
+  const before = calls.length;
+  assert.equal((await request('/img/msg_AE72DF0B.gif')).status, 404);
+  assert.equal(calls.length, before);
 });
 
 test('constructing the plugin makes no upstream request (AE5)', () => {
