@@ -581,27 +581,27 @@ test('a newer message supersedes a face load still in flight', async () => {
     stale: false,
   });
   for (const outcome of ['resolve', 'reject']) {
-    const h = harness({ snapshot: at('msg_0000000A') });
+    const h = harness({ snapshot: at('msg_4D617474') });
     await h.layer.update(h.viewer);
     await settle();
-    const late = h.parkFace('msg_0000000B');
-    h.setSnapshot(at('msg_0000000B'));
+    const late = h.parkFace('msg_2042656E');
+    h.setSnapshot(at('msg_2042656E'));
     await h.layer.update(h.viewer);
-    h.setSnapshot(at('msg_0000000C'));
+    h.setSnapshot(at('msg_65736368'));
     await h.layer.update(h.viewer);
     await settle();
     // C is fetched and drawn without waiting for B or another trigger.
     assert.deepEqual(h.requests.faces, [
-      'msg_0000000A',
-      'msg_0000000B',
-      'msg_0000000C',
+      'msg_4D617474',
+      'msg_2042656E',
+      'msg_65736368',
     ]);
-    assert.equal(h.drawn.at(-1).image.message, 'msg_0000000C');
+    assert.equal(h.drawn.at(-1).image.message, 'msg_65736368');
 
     if (outcome === 'resolve') late.resolve();
     else late.reject(new Error('MnDOT HTTP 404'));
     await settle();
-    assert.equal(h.drawn.at(-1).image.message, 'msg_0000000C', outcome);
+    assert.equal(h.drawn.at(-1).image.message, 'msg_65736368', outcome);
     assert.equal(h.faces().length, 1, outcome);
     assert.equal(h.faces()[0].image.stamp, 2, outcome); // A, then C only
     h.layer.destroy();
@@ -609,18 +609,18 @@ test('a newer message supersedes a face load still in flight', async () => {
 
   // A superseded first load that fails while the newer one is still in
   // flight drops neither the face nor that newer load.
-  const h = harness({ snapshot: at('msg_0000000B') });
-  const first = h.parkFace('msg_0000000B');
+  const h = harness({ snapshot: at('msg_2042656E') });
+  const first = h.parkFace('msg_2042656E');
   await h.layer.update(h.viewer);
-  const next = h.parkFace('msg_0000000C');
-  h.setSnapshot(at('msg_0000000C'));
+  const next = h.parkFace('msg_65736368');
+  h.setSnapshot(at('msg_65736368'));
   await h.layer.update(h.viewer);
   first.reject(new Error('MnDOT HTTP 404'));
   await settle();
   next.resolve();
   await settle();
   assert.equal(h.faces().length, 1);
-  assert.equal(h.drawn.at(-1).image.message, 'msg_0000000C');
+  assert.equal(h.drawn.at(-1).image.message, 'msg_65736368');
   assert.equal(h.requests.faces.length, 2);
   h.layer.destroy();
 });
@@ -631,9 +631,9 @@ test('a new message whose GIF fails takes the old face down until a retry works'
     ageMs: 0,
     stale: false,
   });
-  const missing = new Set(['msg_0000000B']);
+  const missing = new Set(['msg_2042656E']);
   const h = harness({
-    snapshot: at('msg_0000000A', 'LEFT LANE CLOSED'),
+    snapshot: at('msg_4D617474', 'LEFT LANE CLOSED'),
     missing,
   });
   await h.layer.update(h.viewer);
@@ -641,8 +641,8 @@ test('a new message whose GIF fails takes the old face down until a retry works'
   h.faces()[0].activate();
   const [decoder] = h.decoders;
 
-  const failing = h.parkFace('msg_0000000B');
-  h.setSnapshot(at('msg_0000000B', 'ALL LANES OPEN'));
+  const failing = h.parkFace('msg_2042656E');
+  h.setSnapshot(at('msg_2042656E', 'ALL LANES OPEN'));
   await h.layer.update(h.viewer);
   await settle();
   const rendered = h.renders();
@@ -657,18 +657,18 @@ test('a new message whose GIF fails takes the old face down until a retry works'
   assert.equal(h.cards()[0].details[0], 'ALL LANES OPEN');
 
   // The next poll tries B again, and this time MnDOT serves it.
-  missing.delete('msg_0000000B');
+  missing.delete('msg_2042656E');
   await h.layer.update(h.viewer);
   await settle();
   assert.deepEqual(
     h.faces().map((face) => face.id),
     ['V1'],
   );
-  assert.equal(h.drawn.at(-1).image.message, 'msg_0000000B');
+  assert.equal(h.drawn.at(-1).image.message, 'msg_2042656E');
   assert.deepEqual(h.requests.faces, [
-    'msg_0000000A',
-    'msg_0000000B',
-    'msg_0000000B',
+    'msg_4D617474',
+    'msg_2042656E',
+    'msg_2042656E',
   ]);
   h.layer.destroy();
 });
@@ -680,20 +680,20 @@ test('a GIF of another size gets a new slot; the same size keeps it', async () =
     stale: false,
   });
   const h = harness({
-    snapshot: at('msg_0000000A'),
-    sizes: { msg_0000000C: [288, 100] },
+    snapshot: at('msg_4D617474'),
+    sizes: { msg_65736368: [288, 100] },
   });
   await h.layer.update(h.viewer);
   await settle();
   const first = h.faces()[0].image;
 
-  h.setSnapshot(at('msg_0000000B'));
+  h.setSnapshot(at('msg_2042656E'));
   await h.layer.update(h.viewer);
   await settle();
   assert.equal(h.faces()[0].image, first); // 412x100 again: same slot
   assert.equal(first.stamp, 2);
 
-  h.setSnapshot(at('msg_0000000C'));
+  h.setSnapshot(at('msg_65736368'));
   await h.layer.update(h.viewer);
   await settle();
   const [face] = h.faces();
@@ -977,14 +977,14 @@ test('released and replaced faces close every decoder they opened', async () => 
     ageMs: 0,
     stale: false,
   });
-  h = harness({ snapshot: at('msg_0000000A') });
+  h = harness({ snapshot: at('msg_4D617474') });
   await h.layer.update(h.viewer);
   await settle();
-  decoding = h.parkDecode('msg_0000000B', 0);
-  h.setSnapshot(at('msg_0000000B'));
+  decoding = h.parkDecode('msg_2042656E', 0);
+  h.setSnapshot(at('msg_2042656E'));
   await h.layer.update(h.viewer);
   await settle();
-  h.setSnapshot(at('msg_0000000C'));
+  h.setSnapshot(at('msg_65736368'));
   await h.layer.update(h.viewer);
   await settle();
   decoding.resolve();
@@ -992,12 +992,12 @@ test('released and replaced faces close every decoder they opened', async () => 
   assert.deepEqual(
     h.decoders.map((decoder) => [decoder.message, decoder.closed]),
     [
-      ['msg_0000000A', true],
-      ['msg_0000000B', true],
-      ['msg_0000000C', false],
+      ['msg_4D617474', true],
+      ['msg_2042656E', true],
+      ['msg_65736368', false],
     ],
   );
-  assert.equal(h.drawn.at(-1).image.message, 'msg_0000000C');
+  assert.equal(h.drawn.at(-1).image.message, 'msg_65736368');
   h.layer.destroy();
   assert.ok(h.decoders.every((decoder) => decoder.closed));
 });
