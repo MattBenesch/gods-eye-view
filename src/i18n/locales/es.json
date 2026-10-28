@@ -3015,5 +3015,7 @@
   "MnDOT data {age}": "Datos de MnDOT {age}",
   "STALE · MnDOT data {age}": "DESACTUALIZADO · datos de MnDOT {age}",
   "Page {n} of {total}": "Página {n} de {total}",
-  "Graphic only": "Solo gráfico"
+  "Graphic only": "Solo gráfico",
+  "routing busy — too many routes at once": "servicio de rutas ocupado: demasiadas rutas a la vez",
+  "route proxy error": "error del proxy de rutas"
 }

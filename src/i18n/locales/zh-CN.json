@@ -2875,5 +2875,7 @@
   "MnDOT data {age}": "MnDOT 数据 {age}",
   "STALE · MnDOT data {age}": "已过时 · MnDOT 数据 {age}",
   "Page {n} of {total}": "第 {n} 页，共 {total} 页",
-  "Graphic only": "仅图形"
+  "Graphic only": "仅图形",
+  "routing busy — too many routes at once": "路线服务繁忙：同时请求的路线过多",
+  "route proxy error": "路线代理出错"
 }
