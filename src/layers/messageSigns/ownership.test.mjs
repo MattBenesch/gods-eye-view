@@ -6,9 +6,49 @@ import { createMessageSignsLayer } from './index.js';
 import { FACE_BUDGET } from './faces.js';
 
 const FLOOR_M = 250;
+const STALE_DIM = 'rgba(0, 0, 0, 0.5)';
 const settle = async () => {
   for (let i = 0; i < 12; i++) await new Promise((done) => setImmediate(done));
 };
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/** A ground-floor service whose cells stay cold until a test warms them. */
+function coldFloors() {
+  const warm = new Set();
+  const cell = (lat, lon) => `${lat},${lon}`;
+  const bounded = [];
+  const background = [];
+  return {
+    bounded,
+    background,
+    warm(cells) {
+      for (const { lat, lon } of cells) warm.add(cell(lat, lon));
+    },
+    service: {
+      cachedGroundFloor: (lat, lon) =>
+        warm.has(cell(lat, lon)) ? FLOOR_M : null,
+      resolveGroundFloorCellsBounded(cells) {
+        const gate = deferred();
+        bounded.push({ cells, gate });
+        return gate.promise;
+      },
+      resolveGroundFloorCells(cells, { signal }) {
+        const gate = deferred();
+        background.push({ cells, signal, gate });
+        return gate.promise;
+      },
+    },
+  };
+}
 
 function gifBytes(width = 412, height = 100) {
   const bytes = new Uint8Array(32);
@@ -33,7 +73,13 @@ function harness({
   snapshot,
   frames = {},
   missing = new Set(),
+  sizes = {},
   reducedMotion = false,
+  groundFloor = {
+    cachedGroundFloor: () => FLOOR_M,
+    resolveGroundFloorCellsBounded: async () => {},
+    resolveGroundFloorCells: async () => {},
+  },
 } = {}) {
   const clock = { now: 1_000_000 };
   const pending = new Map();
@@ -60,8 +106,10 @@ function harness({
 
   const entries = new Map();
   const visible = new Map();
+  let publishes = 0;
   const overlayHost = {
     setEntries(sourceId, list) {
+      publishes += 1;
       entries.set(sourceId, list);
     },
     setVisible(sourceId, value) {
@@ -132,6 +180,9 @@ function harness({
 
   let current = snapshot ?? { signs: [], ageMs: 5000, stale: false };
   const requests = { list: 0, faces: [] };
+  // Parked loads: message -> deferred, and `message#frameIndex` -> deferred.
+  const faceGates = new Map();
+  const decodeGates = new Map();
   const source = {
     async getSnapshot() {
       requests.list += 1;
@@ -140,11 +191,15 @@ function harness({
     },
     async getFaceImage(message) {
       requests.faces.push(message);
+      const gate = faceGates.get(message);
+      faceGates.delete(message);
+      if (gate) await gate.promise;
       if (missing.has(message)) throw new Error('MnDOT HTTP 404');
-      return gifBytes();
+      return gifBytes(...(sizes[message] ?? []));
     },
   };
 
+  const decoders = [];
   class FakeDecoder {
     static async isTypeSupported() {
       return true;
@@ -152,17 +207,37 @@ function harness({
     constructor({ data }) {
       this.frameCount = frames[data.message] ?? 1;
       this.message = data.message;
+      this.closed = false;
+      this.waiting = new Set();
       this.tracks = {
         ready: Promise.resolve(),
         selectedTrack: { frameCount: this.frameCount },
       };
+      decoders.push(this);
     }
     async decode({ frameIndex }) {
+      const key = `${this.message}#${frameIndex}`;
+      const gate = decodeGates.get(key);
+      decodeGates.delete(key);
+      if (gate) {
+        this.waiting.add(gate);
+        try {
+          await gate.promise;
+        } finally {
+          this.waiting.delete(gate);
+        }
+      }
+      if (this.closed) throw new DOMException('Closed', 'InvalidStateError');
       return {
         image: { message: this.message, frameIndex, duration: 1_000_000 },
       };
     }
-    close() {}
+    close() {
+      this.closed = true;
+      // As ImageDecoder: closing rejects the decodes still running.
+      for (const gate of this.waiting)
+        gate.reject(new DOMException('Aborted', 'AbortError'));
+    }
   }
   // getFaceImage returns fresh bytes; tag them so the decoder knows which.
   const tagged = source.getFaceImage;
@@ -179,10 +254,15 @@ function harness({
       height,
       getContext: () => ({
         imageSmoothingEnabled: true,
+        fillStyle: '',
         clearRect() {},
-        fillRect() {},
+        fillRect() {
+          // A fill after a drawn frame is the stale dim over it.
+          const last = drawn.findLast((entry) => entry.canvas === canvas);
+          if (last) last.fill = this.fillStyle;
+        },
         drawImage(image) {
-          drawn.push({ canvas, image });
+          drawn.push({ canvas, image, fill: null });
         },
         strokeRect() {},
       }),
@@ -191,6 +271,7 @@ function harness({
     return canvas;
   };
 
+  let pointerFree = true;
   const layer = createMessageSignsLayer({
     source,
     overlayHost,
@@ -199,7 +280,7 @@ function harness({
       registerPickOwner() {},
       unregisterPickOwner() {},
     },
-    pointer: { isPointerFree: () => true },
+    pointer: { isPointerFree: () => pointerFree },
     screenSpaceEventHandlerFactory: () => ({
       setInputAction(fn) {
         click = fn;
@@ -208,13 +289,7 @@ function harness({
         click = null;
       },
     }),
-    surface: {
-      groundFloor: {
-        cachedGroundFloor: () => FLOOR_M,
-        resolveGroundFloorCellsBounded: async () => {},
-        resolveGroundFloorCells: async () => {},
-      },
-    },
+    surface: { groundFloor },
     requestRender: () => {
       renders += 1;
     },
@@ -240,12 +315,29 @@ function harness({
     primitives,
     requests,
     drawn,
+    decoders,
     listeners,
     statusNodes,
     moveEnd,
     renders: () => renders,
+    publishes: () => publishes,
     setSnapshot(value) {
       current = value;
+    },
+    /** Hold the next getFaceImage for `message` until the test settles it. */
+    parkFace(message) {
+      const gate = deferred();
+      faceGates.set(message, gate);
+      return gate;
+    },
+    /** Hold the next decode of `message`'s frame until the test settles it. */
+    parkDecode(message, frameIndex) {
+      const gate = deferred();
+      decodeGates.set(`${message}#${frameIndex}`, gate);
+      return gate;
+    },
+    set pointerFree(value) {
+      pointerFree = value;
     },
     setVisibility(state) {
       documentRef.visibilityState = state;
@@ -343,6 +435,106 @@ test('every lit sign gets a marker; only the nearest get faces', async () => {
   h.layer.destroy();
 });
 
+test('signs on cold ground floors appear once a floor resolve warms them', async () => {
+  const snapshot = {
+    signs: [sign('V1', 'msg_00000001')],
+    ageMs: 0,
+    stale: false,
+  };
+  // The bounded resolve warms the cell before the list is applied.
+  let floors = coldFloors();
+  let h = harness({ snapshot, groundFloor: floors.service });
+  let pending = h.layer.update(h.viewer);
+  await settle();
+  assert.equal(h.markers(), null);
+  assert.equal(h.faces().length, 0);
+  floors.warm(floors.bounded[0].cells);
+  floors.bounded[0].gate.resolve();
+  assert.equal(await pending, true);
+  await settle();
+  assert.equal(h.markers().length, 1);
+  assert.equal(h.faces().length, 1);
+  assert.equal(floors.background.length, 0);
+  h.layer.destroy();
+
+  // Still cold after it: the list applies without the sign's marker or
+  // face, and the background resolve brings them in.
+  floors = coldFloors();
+  h = harness({ snapshot, groundFloor: floors.service });
+  pending = h.layer.update(h.viewer);
+  await settle();
+  floors.bounded[0].gate.resolve();
+  assert.equal(await pending, true);
+  await settle();
+  assert.equal(h.layer.getStats().count, 1);
+  assert.equal(h.markers().length, 0);
+  assert.equal(h.faces().length, 0);
+  assert.deepEqual(floors.background[0].cells, [{ lat: 44.95, lon: -93.2 }]);
+  floors.warm(floors.background[0].cells);
+  floors.background[0].gate.resolve();
+  await settle();
+  assert.equal(h.markers().length, 1);
+  assert.equal(h.faces().length, 1);
+  h.layer.destroy();
+});
+
+test('a rejected floor resolve leaves the layer enabled for the next poll', async () => {
+  const snapshot = {
+    signs: [sign('V1', 'msg_00000001')],
+    ageMs: 0,
+    stale: false,
+  };
+  const floors = coldFloors();
+  const h = harness({ snapshot, groundFloor: floors.service });
+  const pending = h.layer.update(h.viewer);
+  await settle();
+  floors.bounded[0].gate.reject(new Error('terrain unavailable'));
+  assert.equal(await pending, true);
+  floors.background[0].gate.reject(new Error('terrain unavailable'));
+  await settle();
+  assert.equal(h.layer.getStats().status, 'ok');
+  assert.equal(h.markers().length, 0);
+  assert.equal(h.faces().length, 0);
+
+  floors.warm(snapshot.signs);
+  assert.equal(await h.layer.update(h.viewer), true);
+  await settle();
+  assert.equal(h.markers().length, 1);
+  assert.equal(h.faces().length, 1);
+  h.layer.destroy();
+});
+
+test('disabling mid floor resolve publishes nothing afterwards', async () => {
+  const snapshot = {
+    signs: [sign('V1', 'msg_00000001')],
+    ageMs: 0,
+    stale: false,
+  };
+  for (const stage of ['bounded', 'background']) {
+    const floors = coldFloors();
+    const h = harness({ snapshot, groundFloor: floors.service });
+    const pending = h.layer.update(h.viewer);
+    await settle();
+    if (stage === 'background') {
+      floors.bounded[0].gate.resolve();
+      assert.equal(await pending, true);
+    }
+    h.layer.disable();
+    const published = h.publishes();
+    const rendered = h.renders();
+    floors.warm(snapshot.signs);
+    floors[stage][0].gate.resolve();
+    if (stage === 'bounded') assert.equal(await pending, false);
+    else assert.equal(floors.background[0].signal.aborted, true);
+    await settle();
+    assert.equal(h.publishes(), published, stage);
+    assert.equal(h.renders(), rendered, stage);
+    assert.equal(h.primitives.length, 0, stage);
+    assert.equal(h.faces().length, 0, stage);
+    h.layer.destroy();
+  }
+});
+
 test('a changed message redraws only its face; a blank sign leaves (AE3)', async () => {
   const h = harness({
     snapshot: {
@@ -382,6 +574,138 @@ test('a changed message redraws only its face; a blank sign leaves (AE3)', async
   h.layer.destroy();
 });
 
+test('a newer message supersedes a face load still in flight', async () => {
+  const at = (message) => ({
+    signs: [sign('V1', message)],
+    ageMs: 0,
+    stale: false,
+  });
+  for (const outcome of ['resolve', 'reject']) {
+    const h = harness({ snapshot: at('msg_0000000A') });
+    await h.layer.update(h.viewer);
+    await settle();
+    const late = h.parkFace('msg_0000000B');
+    h.setSnapshot(at('msg_0000000B'));
+    await h.layer.update(h.viewer);
+    h.setSnapshot(at('msg_0000000C'));
+    await h.layer.update(h.viewer);
+    await settle();
+    // C is fetched and drawn without waiting for B or another trigger.
+    assert.deepEqual(h.requests.faces, [
+      'msg_0000000A',
+      'msg_0000000B',
+      'msg_0000000C',
+    ]);
+    assert.equal(h.drawn.at(-1).image.message, 'msg_0000000C');
+
+    if (outcome === 'resolve') late.resolve();
+    else late.reject(new Error('MnDOT HTTP 404'));
+    await settle();
+    assert.equal(h.drawn.at(-1).image.message, 'msg_0000000C', outcome);
+    assert.equal(h.faces().length, 1, outcome);
+    assert.equal(h.faces()[0].image.stamp, 2, outcome); // A, then C only
+    h.layer.destroy();
+  }
+
+  // A superseded first load that fails while the newer one is still in
+  // flight drops neither the face nor that newer load.
+  const h = harness({ snapshot: at('msg_0000000B') });
+  const first = h.parkFace('msg_0000000B');
+  await h.layer.update(h.viewer);
+  const next = h.parkFace('msg_0000000C');
+  h.setSnapshot(at('msg_0000000C'));
+  await h.layer.update(h.viewer);
+  first.reject(new Error('MnDOT HTTP 404'));
+  await settle();
+  next.resolve();
+  await settle();
+  assert.equal(h.faces().length, 1);
+  assert.equal(h.drawn.at(-1).image.message, 'msg_0000000C');
+  assert.equal(h.requests.faces.length, 2);
+  h.layer.destroy();
+});
+
+test('a new message whose GIF fails takes the old face down until a retry works', async () => {
+  const at = (message, multi) => ({
+    signs: [sign('V1', message, { multi })],
+    ageMs: 0,
+    stale: false,
+  });
+  const missing = new Set(['msg_0000000B']);
+  const h = harness({
+    snapshot: at('msg_0000000A', 'LEFT LANE CLOSED'),
+    missing,
+  });
+  await h.layer.update(h.viewer);
+  await settle();
+  h.faces()[0].activate();
+  const [decoder] = h.decoders;
+
+  const failing = h.parkFace('msg_0000000B');
+  h.setSnapshot(at('msg_0000000B', 'ALL LANES OPEN'));
+  await h.layer.update(h.viewer);
+  await settle();
+  const rendered = h.renders();
+  failing.resolve(); // MnDOT answers 404 for B
+  await settle();
+  // No face is left showing A under a card that reads B.
+  assert.equal(h.faces().length, 0);
+  assert.equal(decoder.closed, true);
+  assert.equal(h.renders(), rendered + 1);
+  assert.equal(h.layer.getStats().faces, 0);
+  assert.equal(h.markers().length, 1);
+  assert.equal(h.cards()[0].details[0], 'ALL LANES OPEN');
+
+  // The next poll tries B again, and this time MnDOT serves it.
+  missing.delete('msg_0000000B');
+  await h.layer.update(h.viewer);
+  await settle();
+  assert.deepEqual(
+    h.faces().map((face) => face.id),
+    ['V1'],
+  );
+  assert.equal(h.drawn.at(-1).image.message, 'msg_0000000B');
+  assert.deepEqual(h.requests.faces, [
+    'msg_0000000A',
+    'msg_0000000B',
+    'msg_0000000B',
+  ]);
+  h.layer.destroy();
+});
+
+test('a GIF of another size gets a new slot; the same size keeps it', async () => {
+  const at = (message) => ({
+    signs: [sign('V1', message)],
+    ageMs: 0,
+    stale: false,
+  });
+  const h = harness({
+    snapshot: at('msg_0000000A'),
+    sizes: { msg_0000000C: [288, 100] },
+  });
+  await h.layer.update(h.viewer);
+  await settle();
+  const first = h.faces()[0].image;
+
+  h.setSnapshot(at('msg_0000000B'));
+  await h.layer.update(h.viewer);
+  await settle();
+  assert.equal(h.faces()[0].image, first); // 412x100 again: same slot
+  assert.equal(first.stamp, 2);
+
+  h.setSnapshot(at('msg_0000000C'));
+  await h.layer.update(h.viewer);
+  await settle();
+  const [face] = h.faces();
+  assert.notEqual(face.image, first);
+  assert.equal(face.image.stamp, 1);
+  assert.equal(face.image.frame.width, 288);
+  assert.equal(face.image.frame.height, 100);
+  assert.equal(face.thumbnailWidth, 144);
+  assert.equal(face.thumbnailHeight, 50);
+  h.layer.destroy();
+});
+
 test('clicking a face opens its card below; again, Escape or a drop closes it (AE4)', async () => {
   const h = harness({
     snapshot: {
@@ -406,13 +730,19 @@ test('clicking a face opens its card below; again, Escape or a drop closes it (A
   ]);
   assert.match(h.statusNodes[0].textContent, /CRASH AHEAD, USE CAUTION/);
   assert.equal(h.faces()[0].protected, true);
+  assert.equal(h.faces()[0].active, true);
 
+  // Closing republishes the face without its selected state.
   h.faces()[0].activate();
   assert.equal(h.cards().length, 0);
+  assert.equal(h.faces()[0].protected, false);
+  assert.equal(h.faces()[0].active, false);
 
   h.faces()[0].activate();
   h.listeners.get('keydown')({ key: 'Escape' });
   assert.equal(h.cards().length, 0);
+  assert.equal(h.faces()[0].protected, false);
+  assert.equal(h.faces()[0].active, false);
 
   // A click on the face (hit test) opens it; a new message refreshes it.
   h.hostHit = (x, y, { sourceId }) =>
@@ -446,6 +776,72 @@ test("a marker click selects; another layer's object keeps the click", async () 
   assert.equal(h.cards().length, 1);
   h.click({ x: 1, y: 1 }); // empty globe
   assert.equal(h.cards().length, 0);
+  h.layer.destroy();
+});
+
+test('clicks are ignored while another tool owns the pointer', async () => {
+  const h = harness({
+    snapshot: { signs: [sign('V1', 'msg_00000001')], ageMs: 0, stale: false },
+  });
+  await h.layer.update(h.viewer);
+  await settle();
+  h.hostHit = (x, y, { sourceId }) =>
+    sourceId === 'message-signs' ? { entryId: 'V1' } : null;
+  h.pointerFree = false;
+  h.click({ x: 1, y: 1 }, { id: 'message-sign:V1' }); // marker
+  h.click({ x: 10, y: 10 }); // face
+  assert.equal(h.cards().length, 0);
+
+  h.pointerFree = true;
+  h.click({ x: 10, y: 10 });
+  assert.equal(h.cards().length, 1);
+  h.pointerFree = false;
+  h.hostHit = () => null;
+  h.click({ x: 1, y: 1 }); // empty globe, but busy: the card stays
+  assert.equal(h.cards().length, 1);
+  h.layer.destroy();
+});
+
+test('an open card is announced when its message changes, not every poll', async () => {
+  const h = harness({
+    snapshot: {
+      signs: [sign('V1', 'msg_00000001', { multi: 'CRASH AHEAD' })],
+      ageMs: 45_000,
+      stale: false,
+    },
+  });
+  await h.layer.update(h.viewer);
+  await settle();
+  h.faces()[0].activate();
+  const announced = h.statusNodes[0].textContent;
+  assert.match(announced, /CRASH AHEAD/);
+
+  // Same message, older data: the card's age line moves, the status stays.
+  h.setSnapshot({
+    signs: [sign('V1', 'msg_00000001', { multi: 'CRASH AHEAD' })],
+    ageMs: 75_000,
+    stale: false,
+  });
+  await h.layer.update(h.viewer);
+  assert.equal(h.cards()[0].details.at(-1), 'MnDOT data 75 seconds ago');
+  assert.equal(h.statusNodes[0].textContent, announced);
+
+  h.setSnapshot({
+    signs: [sign('V1', 'msg_00000002', { multi: 'ALL LANES OPEN' })],
+    ageMs: 0,
+    stale: false,
+  });
+  await h.layer.update(h.viewer);
+  assert.match(h.statusNodes[0].textContent, /ALL LANES OPEN/);
+
+  // Going stale is news too.
+  h.setSnapshot({
+    signs: [sign('V1', 'msg_00000002', { multi: 'ALL LANES OPEN' })],
+    ageMs: 180_000,
+    stale: true,
+  });
+  await h.layer.update(h.viewer);
+  assert.match(h.statusNodes[0].textContent, /STALE/);
   h.layer.destroy();
 });
 
@@ -509,6 +905,103 @@ test('late, superseded and post-destroy results change nothing', async () => {
   h.layer.destroy();
 });
 
+test('face loads in flight at disable or destroy are dropped and closed', async () => {
+  for (const action of ['disable', 'destroy']) {
+    const h = harness({
+      snapshot: {
+        signs: [
+          sign('V1', 'msg_00000001'),
+          sign('V2', 'msg_00000002'),
+          sign('V3', 'msg_00000003'),
+        ],
+        ageMs: 0,
+        stale: false,
+      },
+    });
+    const fetching = h.parkFace('msg_00000002');
+    const decoding = h.parkDecode('msg_00000003', 0);
+    await h.layer.update(h.viewer);
+    await settle();
+    assert.deepEqual(
+      h.faces().map((face) => face.id),
+      ['V1'],
+    );
+    assert.equal(h.decoders.length, 2, action); // V1 drawn, V3 decoding
+
+    h.layer[action]();
+    const published = h.publishes();
+    const rendered = h.renders();
+    fetching.resolve();
+    decoding.resolve();
+    await settle();
+    assert.equal(h.decoders.length, 2, action); // V2's late bytes open none
+    assert.ok(
+      h.decoders.every((decoder) => decoder.closed),
+      action,
+    );
+    assert.equal(h.publishes(), published, action);
+    assert.equal(h.renders(), rendered, action);
+    assert.equal(h.faces().length, 0, action);
+  }
+});
+
+test('released and replaced faces close every decoder they opened', async () => {
+  // Released by moveEnd: the drawn face and the one still decoding.
+  let h = harness({
+    snapshot: {
+      signs: [sign('V1', 'msg_00000001'), sign('V2', 'msg_00000002')],
+      ageMs: 0,
+      stale: false,
+    },
+  });
+  let decoding = h.parkDecode('msg_00000002', 0);
+  await h.layer.update(h.viewer);
+  await settle();
+  h.viewer.camera.positionCartographic = Cesium.Cartographic.fromDegrees(
+    -93.2,
+    44.95,
+    400_000,
+  );
+  for (const fn of h.moveEnd) fn();
+  decoding.resolve();
+  await settle();
+  assert.equal(h.faces().length, 0);
+  assert.equal(h.decoders.length, 2);
+  assert.ok(h.decoders.every((decoder) => decoder.closed));
+  h.layer.destroy();
+
+  // Replaced: A's decoder closes when C is drawn, and B's, superseded
+  // mid-decode, closes when its decode returns.
+  const at = (message) => ({
+    signs: [sign('V1', message)],
+    ageMs: 0,
+    stale: false,
+  });
+  h = harness({ snapshot: at('msg_0000000A') });
+  await h.layer.update(h.viewer);
+  await settle();
+  decoding = h.parkDecode('msg_0000000B', 0);
+  h.setSnapshot(at('msg_0000000B'));
+  await h.layer.update(h.viewer);
+  await settle();
+  h.setSnapshot(at('msg_0000000C'));
+  await h.layer.update(h.viewer);
+  await settle();
+  decoding.resolve();
+  await settle();
+  assert.deepEqual(
+    h.decoders.map((decoder) => [decoder.message, decoder.closed]),
+    [
+      ['msg_0000000A', true],
+      ['msg_0000000B', true],
+      ['msg_0000000C', false],
+    ],
+  );
+  assert.equal(h.drawn.at(-1).image.message, 'msg_0000000C');
+  h.layer.destroy();
+  assert.ok(h.decoders.every((decoder) => decoder.closed));
+});
+
 test('animated faces flip on their own delay, one render per flip (R3)', async () => {
   const h = harness({
     snapshot: {
@@ -550,6 +1043,34 @@ test('animated faces flip on their own delay, one render per flip (R3)', async (
   h.layer.destroy();
 });
 
+test('a message change mid-flip keeps the new animated face flipping', async () => {
+  const h = harness({
+    snapshot: { signs: [sign('V1', 'msg_000000F2')], ageMs: 0, stale: false },
+    frames: { msg_000000F2: 2, msg_000000F3: 2 },
+  });
+  await h.layer.update(h.viewer);
+  await settle();
+  // The flip is still decoding when the next message closes its decoder,
+  // which rejects that decode.
+  h.parkDecode('msg_000000F2', 1);
+  const flip = h.advance(1000);
+  h.setSnapshot({
+    signs: [sign('V1', 'msg_000000F3')],
+    ageMs: 0,
+    stale: false,
+  });
+  await h.layer.update(h.viewer);
+  await settle();
+  await flip;
+  assert.equal(h.drawn.at(-1).image.message, 'msg_000000F3');
+  assert.equal(h.pendingTimers.size, 1);
+
+  await h.advance(1000);
+  assert.equal(h.drawn.at(-1).image.message, 'msg_000000F3');
+  assert.equal(h.drawn.at(-1).image.frameIndex, 1);
+  h.layer.destroy();
+});
+
 test('reduced motion holds an animated face on its first frame', async () => {
   const h = harness({
     snapshot: { signs: [sign('V1', 'msg_000000F2')], ageMs: 0, stale: false },
@@ -583,6 +1104,7 @@ test('stale data dims faces; an error clears them; success recovers', async () =
   await h.layer.update(h.viewer);
   await settle();
   h.faces()[0].activate();
+  assert.equal(h.drawn.at(-1).fill, null);
 
   h.setSnapshot({
     signs: [sign('V1', 'msg_00000001')],
@@ -592,6 +1114,7 @@ test('stale data dims faces; an error clears them; success recovers', async () =
   await h.layer.update(h.viewer);
   await settle();
   assert.equal(h.faces()[0].image.stamp, 2); // redrawn dimmed
+  assert.equal(h.drawn.at(-1).fill, STALE_DIM);
   assert.equal(h.cards()[0].details.at(-1), 'STALE · MnDOT data 3 minutes ago');
   assert.equal(layerFeedState(h.layer.getStats()), 'stale');
 
@@ -613,6 +1136,38 @@ test('stale data dims faces; an error clears them; success recovers', async () =
   assert.equal(stats.error, null);
   assert.equal(stats.status, 'ok');
   assert.equal(h.faces().length, 1);
+  h.layer.destroy();
+});
+
+test('stale faces are dimmed when first drawn and on each flip until fresh', async () => {
+  const h = harness({
+    snapshot: {
+      signs: [sign('V1', 'msg_000000F2')],
+      ageMs: 180_000,
+      stale: true,
+    },
+    frames: { msg_000000F2: 2 },
+  });
+  await h.layer.update(h.viewer);
+  await settle();
+  assert.equal(h.drawn.at(-1).image.frameIndex, 0);
+  assert.equal(h.drawn.at(-1).fill, STALE_DIM); // first load
+  await h.advance(1000);
+  assert.equal(h.drawn.at(-1).image.frameIndex, 1);
+  assert.equal(h.drawn.at(-1).fill, STALE_DIM); // flip
+
+  h.setSnapshot({
+    signs: [sign('V1', 'msg_000000F2')],
+    ageMs: 0,
+    stale: false,
+  });
+  await h.layer.update(h.viewer);
+  await settle();
+  assert.equal(h.drawn.at(-1).image.frameIndex, 1); // same frame, undimmed
+  assert.equal(h.drawn.at(-1).fill, null);
+  await h.advance(1000);
+  assert.equal(h.drawn.at(-1).image.frameIndex, 0);
+  assert.equal(h.drawn.at(-1).fill, null);
   h.layer.destroy();
 });
 

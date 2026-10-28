@@ -118,6 +118,16 @@ test('a very long message stays inside the card bounds', () => {
   assert.ok(lines.at(-1).endsWith('…'));
 });
 
+test('a word longer than the card is split at the card width', () => {
+  assert.deepEqual(cardLines(parseMultiText('X'.repeat(64)), labels), [
+    'X'.repeat(44),
+    'X'.repeat(20),
+  ]);
+  const lines = cardLines(parseMultiText(`AB ${'Y'.repeat(60)}`), labels);
+  assert.deepEqual(lines, ['AB', 'Y'.repeat(44), 'Y'.repeat(16)]);
+  assert.ok(lines.every((line) => line.length <= 44));
+});
+
 test('raw input past the cap is read only up to the cap', () => {
   const parsed = parseMultiText(`${'A'.repeat(5000)}[np]TAIL`);
   assert.equal(parsed.pages.length, 1);

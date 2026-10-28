@@ -120,6 +120,8 @@ export function createMessageSignsLayer({
   let _removeMoveEnd = null;
   let _clockTimer = null;
   let _statusNode = null;
+  /** `id|message|stale` last announced, so a poll is not re-read aloud. */
+  let _announcedKey = null;
   /** sign id -> billboard */
   const _markerById = new Map();
   /** sign id -> { message, pending, slot, gif, frameIndex, frameCount, nextFlipAt, css } */
@@ -282,10 +284,19 @@ export function createMessageSignsLayer({
     } catch {
       gif?.close();
       if (signal.aborted || _faces.get(face.id) !== face) return;
-      // A message MnDOT has already replaced: the sign keeps its marker and
-      // card, and the next refresh tries again.
-      if (face.pending === message) face.pending = null;
-      if (!face.slot) _faces.delete(face.id);
+      // A newer message superseded this load: that load owns the face.
+      if (face.pending !== message) return;
+      face.pending = null;
+      if (face.message === message) return; // still showing this message
+      // Often a message MnDOT has already replaced. The face goes rather than
+      // keep an older message under the new card; the sign keeps its marker
+      // and card, and the next refresh tries again.
+      const shown = Boolean(face.slot);
+      releaseFace(face.id);
+      if (!shown) return;
+      publishFaces();
+      scheduleClock();
+      render();
     }
   }
 
@@ -299,7 +310,14 @@ export function createMessageSignsLayer({
     for (const id of wanted) {
       const sign = _byId.get(id);
       let face = _faces.get(id);
-      if (face && (face.message === sign.message || face.pending)) continue;
+      // A different pending message is superseded; isCurrent drops its load.
+      if (
+        face &&
+        (face.pending
+          ? face.pending === sign.message
+          : face.message === sign.message)
+      )
+        continue;
       if (!face) {
         face = { id, message: null, pending: null, slot: null, gif: null };
         _faces.set(id, face);
@@ -443,7 +461,8 @@ export function createMessageSignsLayer({
           }
           frame.close();
         } catch {
-          face.nextFlipAt = null; // Hold the frame already drawn.
+          // Hold the frame already drawn, unless a new GIF replaced this one.
+          if (face.gif === gif) face.nextFlipAt = null;
         }
       }),
     );
@@ -493,7 +512,13 @@ export function createMessageSignsLayer({
       CARD_HOST_OPTIONS,
     );
     overlayHost.setVisible?.(MESSAGE_SIGNS_CARD_SOURCE_ID, true);
-    announce(card.spoken);
+    // The age line changes every poll; only a new sign, message or stale
+    // state is worth reading again.
+    const key = `${sign.id}|${sign.message}|${_stale}`;
+    if (key !== _announcedKey) {
+      _announcedKey = key;
+      announce(card.spoken);
+    }
   }
 
   function clearSelection() {
@@ -504,6 +529,7 @@ export function createMessageSignsLayer({
       [],
       CARD_HOST_OPTIONS,
     );
+    _announcedKey = null;
     announce('');
     if (had) publishFaces();
   }
@@ -546,14 +572,7 @@ export function createMessageSignsLayer({
       }
       // Any other identified scene object owns this click.
       if (pickId !== null) return;
-      const card = overlayHost.hitTest?.(x, y, {
-        sourceId: MESSAGE_SIGNS_CARD_SOURCE_ID,
-      });
-      if (card) {
-        clearSelection();
-        render();
-        return;
-      }
+      // The card is not interactive, so a click on it closes it below.
       const face = overlayHost.hitTest?.(x, y, {
         sourceId: MESSAGE_SIGNS_FACE_SOURCE_ID,
       });

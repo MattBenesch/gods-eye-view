@@ -4,6 +4,7 @@
 // pure helpers run under node --test; decoding and drawing take their browser
 // APIs as arguments so tests can stand them in.
 
+import { approxDistanceKm } from '../../data/approxDistance.js';
 import { gifSize } from './gif.js';
 
 /** Signs with a face at once: bounds image fetches and canvases. */
@@ -30,13 +31,6 @@ export function faceCssSize(bytes) {
   return size ? { width: size.width / 2, height: size.height / 2 } : null;
 }
 
-// Equirectangular distance: ranking only, inside one state.
-function distanceKm(aLat, aLon, bLat, bLon) {
-  const kmPerDeg = 111.32;
-  const x = (bLon - aLon) * Math.cos(((aLat + bLat) / 2) * (Math.PI / 180));
-  return Math.hypot(x, bLat - aLat) * kmPerDeg;
-}
-
 /**
  * The lit signs that get a face: nearest the camera's ground point, within
  * reach, and none at all above the face altitude.
@@ -51,7 +45,7 @@ export function selectFaceIds(signs, view, limit = FACE_BUDGET) {
   return signs
     .map((sign) => ({
       id: sign.id,
-      km: distanceKm(view.lat, view.lon, sign.lat, sign.lon),
+      km: approxDistanceKm(view.lat, view.lon, sign.lat, sign.lon),
     }))
     .filter(({ km }) => km <= FACE_MAX_DISTANCE_KM)
     .sort((a, b) => a.km - b.km || (a.id < b.id ? -1 : 1))
