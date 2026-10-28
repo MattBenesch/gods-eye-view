@@ -901,6 +901,7 @@
   "src/layers/messageSigns/ownership.test.mjs",
   "src/layers/messageSigns/records.test.mjs",
   "src/layers/messageSigns/source.test.mjs",
+  "scripts/qa-message-signs.mjs",
   "src/layers/cyclones/index.js",
   "src/layers/cyclones/rendering.js",
   "src/layers/cyclones/labels.js",
